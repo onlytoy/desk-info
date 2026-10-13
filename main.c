@@ -259,6 +259,9 @@ typedef struct {
     int hour24;
     int rotate;          /* 屏幕旋转 0-3 */
     int sleep_min;       /* 无操作多少分钟后息屏, 0=不息屏 */
+    int volume;          /* 系统音量 0-40 (实际由 sair 原生 sound 库执行) */
+    int alarm_on;        /* 闹钟开关 */
+    int alarm_h, alarm_m;/* 闹钟时间 */
     char city[32];
     char lat[16];
     char lon[16];
@@ -271,6 +274,7 @@ static pthread_mutex_t g_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 static void cfg_defaults(void)
 {
     g_cfg.brightness = 200; g_cfg.hour24 = 1; g_cfg.rotate = 1; g_cfg.sleep_min = 0;
+    g_cfg.volume = 20; g_cfg.alarm_on = 0; g_cfg.alarm_h = 7; g_cfg.alarm_m = 0;
     snprintf(g_cfg.city, sizeof(g_cfg.city), "深圳");
     snprintf(g_cfg.lat, sizeof(g_cfg.lat), "22.5431");
     snprintf(g_cfg.lon, sizeof(g_cfg.lon), "114.0579");
@@ -306,6 +310,10 @@ static void cfg_load(void)
         else if (!strcmp(k, "refresh"))g_cfg.refresh_min = atoi(v);
         else if (!strcmp(k, "rotate")) g_cfg.rotate = atoi(v) & 3;
         else if (!strcmp(k, "sleep"))  g_cfg.sleep_min = atoi(v);
+        else if (!strcmp(k, "volume")) g_cfg.volume = atoi(v);
+        else if (!strcmp(k, "alarm_on")) g_cfg.alarm_on = atoi(v);
+        else if (!strcmp(k, "alarm_h")) g_cfg.alarm_h = atoi(v);
+        else if (!strcmp(k, "alarm_m")) g_cfg.alarm_m = atoi(v);
     }
     fclose(f);
     if (g_cfg.brightness < 10)  g_cfg.brightness = 10;
@@ -327,6 +335,10 @@ static void cfg_save(void)
     fprintf(f, "refresh=%d\n", g_cfg.refresh_min);
     fprintf(f, "rotate=%d\n", g_cfg.rotate);
     fprintf(f, "sleep=%d\n", g_cfg.sleep_min);
+    fprintf(f, "volume=%d\n", g_cfg.volume);
+    fprintf(f, "alarm_on=%d\n", g_cfg.alarm_on);
+    fprintf(f, "alarm_h=%d\n", g_cfg.alarm_h);
+    fprintf(f, "alarm_m=%d\n", g_cfg.alarm_m);
     fclose(f);
 }
 
@@ -608,8 +620,9 @@ static void httpd_start(void)
     pthread_create(&t, &a, httpd_thread, NULL); pthread_attr_destroy(&a);
 }
 
-/* ==================== 设置界面 ==================== */
+/* ==================== 设置界面（2 页） ==================== */
 static int g_settings = 0;
+static int g_settings_page = 0;    /* 0=主页 1=更多 */
 static time_t g_last_active = 0;   /* 最近一次触摸时刻(息屏计时) */
 static int g_screen_off = 0;
 
@@ -622,6 +635,15 @@ static int hit_row(int sy)
     for (int i = 0; i < SROW_N; i++)
         if (sy >= SROW_Y[i] && sy < SROW_Y[i] + SROW_H - 6) return i;
     return -1;
+}
+
+/* 给 sair 下发命令(文件式 IPC: /tmp/sair_cmd.json) */
+static void sair_cmd(const char *json)
+{
+    int fd = open("/tmp/sair_cmd.json", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    write(fd, json, strlen(json));
+    close(fd);
 }
 
 static void cycle_sleep(void)
@@ -638,6 +660,32 @@ static void cycle_refresh(void)
     g_cfg.refresh_min = v[(i + 1) % 6];
 }
 
+/* 一行: 标签 + 右侧值(整行可点) */
+static void srow_label(int i, const char *label, const char *val, u16 valcolor, u16 bg)
+{
+    int y = SROW_Y[i];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, bg);
+    draw_text(label, 40, y + 20, 6, rgb565(255, 255, 255));
+    if (val[0]) {
+        int w = text_width(val, 6);
+        draw_text(val, SCR_W - 60 - w, y + 20, 6, valcolor);
+    }
+}
+
+/* 一行: 标签 + [-] 数值 [+] */
+static void srow_pm(int i, const char *label, const char *val, u16 bg)
+{
+    int y = SROW_Y[i];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, bg);
+    draw_text(label, 40, y + 20, 6, rgb565(205, 215, 245));
+    fill_rect(232, y + 6, 96, SROW_H - 22, rgb565(72, 72, 112));
+    draw_text("-", 268, y + 20, 7, rgb565(255, 255, 255));
+    fill_rect(SCR_W - 148, y + 6, 96, SROW_H - 22, rgb565(72, 72, 112));
+    draw_text("+", SCR_W - 112, y + 20, 7, rgb565(255, 255, 255));
+    int w = text_width(val, 7);
+    draw_text(val, (328 + SCR_W - 148 - w) / 2, y + 14, 7, rgb565(255, 255, 255));
+}
+
 static void draw_settings(void)
 {
     char buf[32];
@@ -645,49 +693,31 @@ static void draw_settings(void)
         for (int sx = 0; sx < SCR_W; sx++)
             px(sx, sy, rgb565(16, 18, 28));
 
-    /* 行1 亮度: [-] value [+] */
-    int y = SROW_Y[0];
-    fill_rect(20, y, 130, SROW_H - 10, rgb565(60, 60, 95));
-    draw_text("-", 70, y + 20, 7, rgb565(255, 255, 255));
-    snprintf(buf, sizeof(buf), "%d", g_cfg.brightness);
-    int w = text_width(buf, 7);
-    draw_text(buf, (SCR_W - w) / 2, y + 14, 7, rgb565(255, 255, 255));
-    fill_rect(SCR_W - 150, y, 130, SROW_H - 10, rgb565(60, 60, 95));
-    draw_text("+", SCR_W - 100, y + 20, 7, rgb565(255, 255, 255));
-
-    /* 行2 24小时制 */
-    y = SROW_Y[1];
-    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
-    draw_text("24H", 40, y + 20, 6, rgb565(255, 255, 255));
-    draw_text(g_cfg.hour24 ? "ON" : "OFF", SCR_W - 170, y + 20, 6,
-              g_cfg.hour24 ? rgb565(127, 224, 160) : rgb565(210, 130, 130));
-
-    /* 行3 息屏 */
-    y = SROW_Y[2];
-    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
-    draw_text("SLEEP", 40, y + 20, 6, rgb565(255, 255, 255));
-    if (g_cfg.sleep_min == 0) snprintf(buf, sizeof(buf), "OFF");
-    else snprintf(buf, sizeof(buf), "%dM", g_cfg.sleep_min);
-    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
-
-    /* 行4 旋转 */
-    y = SROW_Y[3];
-    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
-    draw_text("ROTATE", 40, y + 20, 6, rgb565(255, 255, 255));
-    snprintf(buf, sizeof(buf), "%d", g_cfg.rotate);
-    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
-
-    /* 行5 天气刷新 */
-    y = SROW_Y[4];
-    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
-    draw_text("REFRESH", 40, y + 20, 6, rgb565(255, 255, 255));
-    snprintf(buf, sizeof(buf), "%dM", g_cfg.refresh_min);
-    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
-
-    /* 行6 返回 */
-    y = SROW_Y[5];
-    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(75, 48, 48));
-    draw_text("BACK", 40, y + 20, 6, rgb565(255, 255, 255));
+    if (g_settings_page == 0) {
+        snprintf(buf, sizeof(buf), "%d", g_cfg.brightness);
+        srow_pm(0, "BRIGHT", buf, rgb565(45, 48, 68));
+        snprintf(buf, sizeof(buf), "%d", g_cfg.volume);
+        srow_pm(1, "VOLUME", buf, rgb565(45, 48, 68));
+        srow_label(2, "24H", g_cfg.hour24 ? "ON" : "OFF",
+                   g_cfg.hour24 ? rgb565(127, 224, 160) : rgb565(210, 130, 130), rgb565(45, 48, 68));
+        if (g_cfg.sleep_min == 0) snprintf(buf, sizeof(buf), "OFF");
+        else snprintf(buf, sizeof(buf), "%dM", g_cfg.sleep_min);
+        srow_label(3, "SLEEP", buf, rgb565(225, 220, 130), rgb565(45, 48, 68));
+        snprintf(buf, sizeof(buf), "%d", g_cfg.rotate);
+        srow_label(4, "ROTATE", buf, rgb565(225, 220, 130), rgb565(45, 48, 68));
+        srow_label(5, "MORE", ">", rgb565(160, 200, 255), rgb565(40, 54, 84));
+    } else {
+        snprintf(buf, sizeof(buf), "%dM", g_cfg.refresh_min);
+        srow_label(0, "REFRESH", buf, rgb565(225, 220, 130), rgb565(45, 48, 68));
+        srow_label(1, "ALARM", g_cfg.alarm_on ? "ON" : "OFF",
+                   g_cfg.alarm_on ? rgb565(127, 224, 160) : rgb565(210, 130, 130), rgb565(45, 48, 68));
+        snprintf(buf, sizeof(buf), "%02d", g_cfg.alarm_h);
+        srow_pm(2, "ALARM-H", buf, rgb565(45, 48, 68));
+        snprintf(buf, sizeof(buf), "%02d", g_cfg.alarm_m);
+        srow_pm(3, "ALARM-M", buf, rgb565(45, 48, 68));
+        srow_label(4, "POWER", "OFF", rgb565(255, 175, 175), rgb565(78, 48, 48));
+        srow_label(5, "BACK", "", rgb565(255, 255, 255), rgb565(78, 48, 48));
+    }
 }
 
 /* ==================== 主程序 ==================== */
@@ -727,6 +757,8 @@ int main(void)
 
     char last_clock[16] = "", last_weather[80] = "", last_sub[300] = "";
     int last_settings = -1, last_brightness = -1, last_hour24 = -1, last_rotate = -1, last_sleep = -1;
+    int last_page = -1, last_volume = -1, last_alarm = -1, last_ah = -1, last_am = -1;
+    int alarm_fired = 0;
     int tick = 0;
     for (;;) {
         /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
@@ -734,6 +766,16 @@ int main(void)
             tick = 0;
             read_pan();
             subtitle_poll();
+            /* 闹钟: 到点唤醒助手出声 */
+            {
+                time_t now = time(NULL);
+                struct tm tm; localtime_r(&now, &tm);
+                if (g_cfg.alarm_on && tm.tm_hour == g_cfg.alarm_h && tm.tm_min == g_cfg.alarm_m) {
+                    if (!alarm_fired) { sair_cmd("{\"cmd\":\"wakeup\"}"); alarm_fired = 1; }
+                } else {
+                    alarm_fired = 0;
+                }
+            }
             /* 息屏: 无操作超过 sleep_min 分钟则关背光 */
             if (g_cfg.sleep_min > 0 && !g_screen_off && g_last_active &&
                 time(NULL) - g_last_active >= g_cfg.sleep_min * 60) {
@@ -771,19 +813,47 @@ int main(void)
                 g_screen_off = 0;
             } else if (g_settings) {
                 int row = hit_row(sy);
-                if (row == 0) {
-                    int hitb = 0;
-                    if (sx < 200) { g_cfg.brightness -= 30; hitb = 1; }
-                    else if (sx > SCR_W - 200) { g_cfg.brightness += 30; hitb = 1; }
-                    if (g_cfg.brightness < 10) g_cfg.brightness = 10;
-                    if (g_cfg.brightness > 900) g_cfg.brightness = 900;
-                    if (hitb) { sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness); cfg_save(); }
+                int leftb = sx < 330;              /* [-] 区域 */
+                int rightb = sx > SCR_W - 200;     /* [+] 区域 */
+                if (g_settings_page == 0) {
+                    if (row == 0) {                /* 亮度 */
+                        if (leftb) g_cfg.brightness -= 30;
+                        else if (rightb) g_cfg.brightness += 30;
+                        if (g_cfg.brightness < 10) g_cfg.brightness = 10;
+                        if (g_cfg.brightness > 900) g_cfg.brightness = 900;
+                        sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
+                        cfg_save();
+                    }
+                    else if (row == 1) {           /* 音量(经 sair 原生 sound 库) */
+                        if (leftb) g_cfg.volume -= 2;
+                        else if (rightb) g_cfg.volume += 2;
+                        if (g_cfg.volume < 0) g_cfg.volume = 0;
+                        if (g_cfg.volume > 40) g_cfg.volume = 40;
+                        char c[64];
+                        snprintf(c, sizeof(c), "{\"cmd\":\"set_config\",\"volume\":%d}", g_cfg.volume);
+                        sair_cmd(c);
+                        cfg_save();
+                    }
+                    else if (row == 2) { g_cfg.hour24 = !g_cfg.hour24; cfg_save(); }
+                    else if (row == 3) { cycle_sleep(); cfg_save(); }
+                    else if (row == 4) { g_cfg.rotate = (g_cfg.rotate + 1) & 3; g_rotate = g_cfg.rotate; cfg_save(); }
+                    else if (row == 5) { g_settings_page = 1; }
+                } else {
+                    if (row == 0) { cycle_refresh(); cfg_save(); }
+                    else if (row == 1) { g_cfg.alarm_on = !g_cfg.alarm_on; cfg_save(); }
+                    else if (row == 2) {
+                        if (leftb) g_cfg.alarm_h = (g_cfg.alarm_h + 23) % 24;
+                        else if (rightb) g_cfg.alarm_h = (g_cfg.alarm_h + 1) % 24;
+                        cfg_save();
+                    }
+                    else if (row == 3) {
+                        if (leftb) g_cfg.alarm_m = (g_cfg.alarm_m + 55) % 60;
+                        else if (rightb) g_cfg.alarm_m = (g_cfg.alarm_m + 5) % 60;
+                        cfg_save();
+                    }
+                    else if (row == 4) { sair_cmd("{\"cmd\":\"poweroff\"}"); }
+                    else if (row == 5) { g_settings = 0; g_settings_page = 0; }
                 }
-                else if (row == 1) { g_cfg.hour24 = !g_cfg.hour24; cfg_save(); }
-                else if (row == 2) { cycle_sleep(); cfg_save(); }
-                else if (row == 3) { g_cfg.rotate = (g_cfg.rotate + 1) & 3; g_rotate = g_cfg.rotate; cfg_save(); }
-                else if (row == 4) { cycle_refresh(); cfg_save(); }
-                else if (row == 5) { g_settings = 0; }
             } else {
                 /* 时钟界面：右上角设置按钮 */
                 if (sx > SCR_W - 200 && sy < 100) g_settings = 1;
@@ -792,13 +862,17 @@ int main(void)
 
         /* 按需重绘(内容变化才画, 避免全屏高频无 vsync 撕裂闪烁) */
         if (g_settings) {
-            if (g_settings != last_settings || g_cfg.brightness != last_brightness ||
-                g_cfg.hour24 != last_hour24 || g_cfg.rotate != last_rotate ||
-                g_cfg.sleep_min != last_sleep) {
+            if (g_settings != last_settings || g_settings_page != last_page ||
+                g_cfg.brightness != last_brightness || g_cfg.hour24 != last_hour24 ||
+                g_cfg.rotate != last_rotate || g_cfg.sleep_min != last_sleep ||
+                g_cfg.volume != last_volume || g_cfg.alarm_on != last_alarm ||
+                g_cfg.alarm_h != last_ah || g_cfg.alarm_m != last_am) {
                 draw_settings();
                 last_settings = g_settings; last_brightness = g_cfg.brightness;
                 last_hour24 = g_cfg.hour24; last_rotate = g_cfg.rotate;
-                last_sleep = g_cfg.sleep_min;
+                last_sleep = g_cfg.sleep_min; last_page = g_settings_page;
+                last_volume = g_cfg.volume; last_alarm = g_cfg.alarm_on;
+                last_ah = g_cfg.alarm_h; last_am = g_cfg.alarm_m;
             }
         } else {
             time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
@@ -829,9 +903,9 @@ int main(void)
                 /* 日期 */
                 int dw = text_width(date, 6);
                 draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 14, 6, rgb565(180, 200, 255));
-                /* 天气(左下, 中文) */
+                /* 天气(左上角, 中文) */
                 if (g_weather_ok)
-                    draw_utf8(g_weather, 24, 200, rgb565(150, 210, 255));
+                    draw_utf8(g_weather, 24, 14, rgb565(150, 210, 255));
                 /* 右上角设置按钮 */
                 fill_rect(SCR_W - 170, 12, 150, 62, rgb565(255, 140, 0));
                 draw_text("SET", SCR_W - 140, 26, 5, rgb565(0, 0, 0));
