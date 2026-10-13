@@ -273,6 +273,37 @@ static int utf8_width(const char *s)
     return w;
 }
 
+/* 居中绘制 UTF-8 文本; 超过 maxw 自动折成两行 */
+static void draw_utf8_centered(const char *s, int y, u16 color)
+{
+    if (!g_font_data || g_font_scale <= 0 || !s || !s[0]) return;
+    int maxw = SCR_W - 40;
+    int w = utf8_width(s);
+    if (w <= maxw) {
+        int x = (SCR_W - w) / 2;
+        if (x < 10) x = 10;
+        draw_utf8(s, x, y, color);
+        return;
+    }
+    /* 太长: 按字符数对半折行 */
+    int total = 0;
+    const char *p = s;
+    while (*p) { utf8_next(&p); total++; }
+    int half = total / 2;
+    p = s;
+    for (int i = 0; i < half && *p; i++) utf8_next(&p);
+    char l1[300], l2[300];
+    int n1 = (int)(p - s);
+    if (n1 > (int)sizeof(l1) - 1) n1 = (int)sizeof(l1) - 1;
+    memcpy(l1, s, n1); l1[n1] = '\0';
+    strncpy(l2, p, sizeof(l2) - 1); l2[sizeof(l2) - 1] = '\0';
+    int w1 = utf8_width(l1), w2 = utf8_width(l2);
+    int x1 = (SCR_W - w1) / 2; if (x1 < 10) x1 = 10;
+    int x2 = (SCR_W - w2) / 2; if (x2 < 10) x2 = 10;
+    draw_utf8(l1, x1, y - 20, color);
+    draw_utf8(l2, x2, y + 22, color);
+}
+
 static void fill_rect(int sx, int sy, int w, int h, u16 c)
 {
     for (int y = sy; y < sy + h; y++)
@@ -968,13 +999,9 @@ int main(void)
                     u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
                     for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
                 }
-                /* 底部字幕条(zhiban 助手 TTS 文本) */
-                if (g_subtitle[0]) {
-                    for (int sy = 348; sy < SCR_H; sy++)
-                        for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, rgb565(26, 34, 56));
-                    for (int sx = 0; sx < SCR_W; sx++) px(sx, 348, rgb565(70, 110, 180));
-                    draw_utf8(g_subtitle, 22, 388, rgb565(214, 232, 255));
-                }
+                /* 底部字幕(助手 TTS 文本): 居中, 不加背景块/分割线 */
+                if (g_subtitle[0])
+                    draw_utf8_centered(g_subtitle, 400, rgb565(214, 232, 255));
                 /* 大时钟(固定位置, 不因子幕出现而上移) */
                 int scale = 22;
                 int cw = text_width(clock, scale);
