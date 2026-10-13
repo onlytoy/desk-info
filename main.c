@@ -239,9 +239,13 @@ static void cfg_save(void)
 }
 
 /* ==================== 触控 ==================== */
-static volatile int g_touch_x, g_touch_y;   /* 原始触摸坐标 */
-static volatile int g_touch_pressed;        /* 0/1 */
+static volatile int g_touch_x, g_touch_y;   /* 当前触摸坐标(横屏 800x480) */
 static volatile int g_key_event;            /* 最近一次按键 code(102/30/242/243) */
+static volatile int g_tap, g_tap_x, g_tap_y;/* 一次点击待处理 */
+
+/* 设备实际事件固定 16 字节(32位内核时间戳)。不用 sizeof(struct input_event):
+ * 工具链头文件可能按 64 位时间戳定义成 24 字节, 导致 read 长度不匹配读不到事件。 */
+struct raw_ev { unsigned int ts, tus; unsigned short type, code; int value; };
 
 static void *touch_thread(void *arg)
 {
@@ -249,23 +253,27 @@ static void *touch_thread(void *arg)
     int fd = open(TOUCH_DEV, O_RDONLY);
     if (fd < 0) return NULL;
     FILE *log = fopen(TOUCH_LOG, "w");
-    struct input_event ev;
+    struct raw_ev ev;
+    int pending = 0;
     for (;;) {
         int n = read(fd, &ev, sizeof(ev));
         if (n != (int)sizeof(ev)) continue;
-        if (log) {
-            fprintf(log, "type=%d code=%d value=%d\n", ev.type, ev.code, ev.value);
-            fflush(log);
-        }
         if (ev.type == EV_ABS) {
-            /* 标准单点(0/1) + 多点(53/54) 都试，其余记日志再校准 */
-            if (ev.code == ABS_X)            g_touch_x = ev.value;
-            else if (ev.code == ABS_Y)       g_touch_y = ev.value;
-            else if (ev.code == ABS_MT_POSITION_X) g_touch_x = ev.value;
+            if (ev.code == ABS_MT_POSITION_X) g_touch_x = ev.value;
             else if (ev.code == ABS_MT_POSITION_Y) g_touch_y = ev.value;
+            else if (ev.code == ABS_MT_TRACKING_ID) {
+                if (ev.value >= 0) pending = 1;   /* 手指按下, 帧末坐标才齐 */
+            }
+            if (log) { fprintf(log, "ABS c=%d v=%d\n", ev.code, ev.value); fflush(log); }
         } else if (ev.type == EV_KEY) {
-            if (ev.code == BTN_TOUCH) g_touch_pressed = ev.value;
-            else if (ev.value == 1)   g_key_event = ev.code;
+            if (ev.value == 1) g_key_event = ev.code;
+            if (log) { fprintf(log, "KEY c=%d v=%d\n", ev.code, ev.value); fflush(log); }
+        } else if (ev.type == EV_SYN) {
+            if (pending) {
+                pending = 0;
+                g_tap_x = g_touch_x; g_tap_y = g_touch_y; g_tap = 1;
+                if (log) { fprintf(log, "TAP x=%d y=%d\n", g_tap_x, g_tap_y); fflush(log); }
+            }
         }
     }
     return NULL;
@@ -284,12 +292,9 @@ static void touch_start(void)
 /* 原始触摸坐标 -> 横屏坐标（与 px 旋转同款，待校准） */
 static void raw_to_screen(int tx, int ty, int *sx, int *sy)
 {
-    switch (g_rotate & 3) {
-    case 0: *sx = FB_H - 1 - ty; *sy = tx;            break;
-    case 1: *sx = ty;            *sy = FB_W - 1 - tx; break;
-    case 2: *sx = ty;            *sy = tx;            break;
-    default:*sx = FB_W - 1 - ty; *sy = FB_H - 1 - tx; break;
-    }
+    /* 触摸设备直接报横屏 800x480 坐标, 与显示同一空间, 无需旋转 */
+    *sx = tx;
+    *sy = ty;
 }
 
 /* ==================== HTTP（保留，远程备用） ==================== */
@@ -475,7 +480,7 @@ int main(void)
 
     char last_clock[16] = "";
     int last_settings = -1, last_brightness = -1, last_hour24 = -1;
-    int last_press = 0, tick = 0;
+    int tick = 0;
     for (;;) {
         /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
         if (++tick >= 30) {
@@ -501,9 +506,10 @@ int main(void)
             else if (key == 243 && g_settings) { g_cfg.brightness -= 20; if (g_cfg.brightness<10) g_cfg.brightness=10; sysfs_write_int(BL_BRIGHTNESS,g_cfg.brightness); cfg_save(); }
             g_key_event = 0;
         }
-        /* 处理触摸 */
-        if (g_touch_pressed && !last_press) {
-            int sx, sy; raw_to_screen(g_touch_x, g_touch_y, &sx, &sy);
+        /* 处理触摸点击 */
+        if (g_tap) {
+            g_tap = 0;
+            int sx, sy; raw_to_screen(g_tap_x, g_tap_y, &sx, &sy);
             if (g_settings) {
                 if (hit(BTN_BRIGHT_MIN, sx, sy)) { g_cfg.brightness -= 20; if(g_cfg.brightness<10)g_cfg.brightness=10; sysfs_write_int(BL_BRIGHTNESS,g_cfg.brightness); cfg_save(); }
                 else if (hit(BTN_BRIGHT_PLUS, sx, sy)) { g_cfg.brightness += 20; if(g_cfg.brightness>900)g_cfg.brightness=900; sysfs_write_int(BL_BRIGHTNESS,g_cfg.brightness); cfg_save(); }
@@ -514,7 +520,6 @@ int main(void)
                 if (sx > SCR_W - 200 && sy < 100) g_settings = 1;
             }
         }
-        last_press = g_touch_pressed;
 
         /* 按需重绘(内容变化才画, 避免全屏高频无 vsync 撕裂闪烁) */
         if (g_settings) {
