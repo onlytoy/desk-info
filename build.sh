@@ -10,6 +10,6 @@ CC="$SDK_PATH/bin/arm-buildroot-linux-uclibcgnueabi-gcc"
 mkdir -p "$BUILD_DIR"
 echo "CC: $CC"
 "$CC" -static -Os -mcpu=cortex-a5 -mfloat-abi=soft \
-    -o "$BUILD_DIR/desk-info" "$SCRIPT_DIR/main.c"
+    -o "$BUILD_DIR/desk-info" "$SCRIPT_DIR/main.c" -lpthread
 echo "built: $BUILD_DIR/desk-info"
 ls -la "$BUILD_DIR/desk-info"
