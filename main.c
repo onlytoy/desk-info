@@ -470,15 +470,23 @@ int main(void)
                     u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
                     for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
                 }
-                for (int sx = 0; sx < SCR_W; sx++) px(sx, 0, rgb565(255,0,0));
-                /* 设置按钮(右上角) */
-                fill_rect(SCR_W - 200, 0, 200, 100, rgb565(40,45,70));
-                draw_text("SET", SCR_W - 170, 25, 7, rgb565(255,255,255));
+                /* 四边粗色条(方向诊断): 上红 下黄 左绿 右蓝 */
+                for (int sy = 0; sy < 16; sy++)
+                    for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, rgb565(255,0,0));
+                for (int sy = SCR_H-16; sy < SCR_H; sy++)
+                    for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, rgb565(255,255,0));
+                for (int sy = 0; sy < SCR_H; sy++)
+                    for (int sx = 0; sx < 16; sx++) px(sx, sy, rgb565(0,255,0));
+                for (int sy = 0; sy < SCR_H; sy++)
+                    for (int sx = SCR_W-16; sx < SCR_W; sx++) px(sx, sy, rgb565(0,120,255));
+                /* 醒目设置按钮(右上角) */
+                fill_rect(SCR_W - 220, 30, 200, 110, rgb565(255,140,0));
+                draw_text("SET", SCR_W - 190, 60, 7, rgb565(0,0,0));
                 int scale = 22;
                 int cw = draw_text(clock, 0, 0, scale, rgb565(0,0,0));
-                draw_text(clock, (SCR_W - cw)/2, (SCR_H - 7*scale)/2 - 20, scale, rgb565(255,255,255));
+                draw_text(clock, (SCR_W - cw)/2, (SCR_H - 7*scale)/2 + 10, scale, rgb565(255,255,255));
                 int dw = draw_text(date, 0, 0, 5, rgb565(0,0,0));
-                draw_text(date, (SCR_W - dw)/2, (SCR_H - 7*scale)/2 + 7*scale + 20, 5, rgb565(200,210,255));
+                draw_text(date, (SCR_W - dw)/2, (SCR_H - 7*scale)/2 + 7*scale + 40, 5, rgb565(220,230,255));
                 strcpy(last_clock, clock);
                 last_settings = g_settings;
             }
