@@ -45,6 +45,18 @@ static inline u16 rgb565(int r, int g, int b)
 
 /* 旋转方向 0-3（可被 /tmp/desk_rotate 运行时覆盖，方便调试切换） */
 static int g_rotate = 1;
+static long g_pan_off = 0;   /* 可见帧在 fb 中的像素偏移(按 pan) */
+
+/* 读 fb 的 pan, 决定往哪一帧写(本设备虚拟 480x1600 = 2 帧 480x800) */
+static void read_pan(void)
+{
+    FILE *f = fopen("/sys/class/graphics/fb0/pan", "r");
+    if (!f) return;
+    int px_ = 0, py = 0;
+    if (fscanf(f, "%d,%d", &px_, &py) == 2)
+        g_pan_off = (long)py * FB_W;
+    fclose(f);
+}
 
 /* 横屏逻辑坐标 -> 帧缓冲，4 种可用变换 */
 static void s2f(int sx, int sy, int *fx, int *fy)
@@ -62,9 +74,8 @@ static inline void px(int sx, int sy, u16 c)
     if (sx < 0 || sx >= SCR_W || sy < 0 || sy >= SCR_H) return;
     int fx, fy;
     s2f(sx, sy, &fx, &fy);
-    long off = (long)fy * FB_W + fx;
+    long off = g_pan_off + (long)fy * FB_W + fx;   /* 只写当前可见帧 */
     g_fb[off] = c;
-    g_fb[off + (long)FB_W * FB_H] = c;
 }
 
 static const unsigned char FONT[12][7] = {
@@ -405,6 +416,15 @@ int main(void)
 
     cfg_load();
     g_rotate = g_cfg.rotate & 3;
+    read_pan();
+    {
+        FILE *lf = fopen("/tmp/desk_fb.log", "w");
+        if (lf) {
+            fprintf(lf, "FB_W=%d FB_H=%d FB_VH=%d SCR_W=%d SCR_H=%d bpp=%d pan_off=%ld rot=%d\n",
+                    FB_W, FB_H, FB_VH, SCR_W, SCR_H, vi.bits_per_pixel, g_pan_off, g_rotate);
+            fclose(lf);
+        }
+    }
     sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
     httpd_start();
     touch_start();
@@ -416,6 +436,7 @@ int main(void)
         /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
         if (++tick >= 30) {
             tick = 0;
+            read_pan();
             int rfd = open("/tmp/desk_rotate", O_RDONLY);
             if (rfd >= 0) {
                 char rb[8]; int rn = read(rfd, rb, sizeof(rb) - 1); close(rfd);
