@@ -46,8 +46,8 @@ static inline u16 rgb565(int r, int g, int b)
 static inline void px(int sx, int sy, u16 c)
 {
     if (sx < 0 || sx >= SCR_W || sy < 0 || sy >= SCR_H) return;
-    int fx = sy;
-    int fy = FB_H - 1 - sx;          /* 旋转方向 A；反了改 fy = sx */
+    int fx = FB_W - 1 - sy;
+    int fy = sx;                     /* 旋转方向(180° 校正版) */
     long off = (long)fy * FB_W + fx;
     g_fb[off] = c;
     g_fb[off + (long)FB_W * FB_H] = c;
@@ -212,8 +212,8 @@ static void touch_start(void)
 /* 原始触摸坐标 -> 横屏坐标（与 px 旋转同款，待校准） */
 static void raw_to_screen(int tx, int ty, int *sx, int *sy)
 {
-    *sx = FB_H - 1 - ty;   /* 假设触摸坐标在竖帧空间 */
-    *sy = tx;
+    *sx = ty;
+    *sy = FB_W - 1 - tx;
 }
 
 /* ==================== HTTP（保留，远程备用） ==================== */
@@ -387,6 +387,8 @@ int main(void)
     httpd_start();
     touch_start();
 
+    char last_clock[16] = "";
+    int last_settings = -1, last_brightness = -1, last_hour24 = -1;
     int last_press = 0;
     for (;;) {
         /* 处理按键 */
@@ -413,9 +415,13 @@ int main(void)
         }
         last_press = g_touch_pressed;
 
-        /* 绘制 */
+        /* 按需重绘(内容变化才画, 避免全屏高频无 vsync 撕裂闪烁) */
         if (g_settings) {
-            draw_settings();
+            if (g_settings != last_settings || g_cfg.brightness != last_brightness ||
+                g_cfg.hour24 != last_hour24) {
+                draw_settings();
+                last_settings = g_settings; last_brightness = g_cfg.brightness; last_hour24 = g_cfg.hour24;
+            }
         } else {
             time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
             int hour = tm.tm_hour;
@@ -423,19 +429,23 @@ int main(void)
             char clock[16], date[40];
             snprintf(clock, sizeof(clock), "%02d:%02d", hour, tm.tm_min);
             snprintf(date, sizeof(date), "%d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
-            for (int sy = 0; sy < SCR_H; sy++) {
-                u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
-                for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
+            if (strcmp(clock, last_clock) != 0 || g_settings != last_settings) {
+                for (int sy = 0; sy < SCR_H; sy++) {
+                    u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
+                    for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
+                }
+                for (int sx = 0; sx < SCR_W; sx++) px(sx, 0, rgb565(255,0,0));
+                /* 设置按钮(右上角) */
+                fill_rect(SCR_W - 200, 0, 200, 100, rgb565(40,45,70));
+                draw_text("SET", SCR_W - 170, 25, 7, rgb565(255,255,255));
+                int scale = 22;
+                int cw = draw_text(clock, 0, 0, scale, rgb565(0,0,0));
+                draw_text(clock, (SCR_W - cw)/2, (SCR_H - 7*scale)/2 - 20, scale, rgb565(255,255,255));
+                int dw = draw_text(date, 0, 0, 5, rgb565(0,0,0));
+                draw_text(date, (SCR_W - dw)/2, (SCR_H - 7*scale)/2 + 7*scale + 20, 5, rgb565(200,210,255));
+                strcpy(last_clock, clock);
+                last_settings = g_settings;
             }
-            for (int sx = 0; sx < SCR_W; sx++) px(sx, 0, rgb565(255,0,0));
-            /* 设置按钮(右上角) */
-            fill_rect(SCR_W - 200, 0, 200, 100, rgb565(40,45,70));
-            draw_text("SET", SCR_W - 170, 25, 7, rgb565(255,255,255));
-            int scale = 22;
-            int cw = draw_text(clock, 0, 0, scale, rgb565(0,0,0));
-            draw_text(clock, (SCR_W - cw)/2, (SCR_H - 7*scale)/2 - 20, scale, rgb565(255,255,255));
-            int dw = draw_text(date, 0, 0, 5, rgb565(0,0,0));
-            draw_text(date, (SCR_W - dw)/2, (SCR_H - 7*scale)/2 + 7*scale + 20, 5, rgb565(200,210,255));
         }
         usleep(30000);
     }
