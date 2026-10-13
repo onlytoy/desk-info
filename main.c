@@ -50,17 +50,44 @@ static inline u16 rgb565(int r, int g, int b)
 
 /* 旋转方向 0-3（可被 /tmp/desk_rotate 运行时覆盖，方便调试切换） */
 static int g_rotate = 1;
-static long g_pan_off = 0;   /* 可见帧在 fb 中的像素偏移(按 pan) */
+static long g_draw_off = 0;      /* 绘制目标帧在 fb 中的像素偏移 */
+static int g_cur_frame = 1;      /* 当前正在显示的帧(0/1) */
 
-/* 读 fb 的 pan, 决定往哪一帧写(本设备虚拟 480x1600 = 2 帧 480x800) */
+/* 读 fb 的 pan, 同步"当前显示帧" */
 static void read_pan(void)
 {
     FILE *f = fopen("/sys/class/graphics/fb0/pan", "r");
     if (!f) return;
     int px_ = 0, py = 0;
-    if (fscanf(f, "%d,%d", &px_, &py) == 2)
-        g_pan_off = (long)py * FB_W;
+    if (fscanf(f, "%d,%d", &px_, &py) == 2) {
+        g_cur_frame = (py / FB_H) & 1;
+        g_draw_off = (long)g_cur_frame * FB_W * FB_H;
+    }
     fclose(f);
+}
+
+/* 双缓冲: 先画到后台帧, 再翻 pan 原子切换 —— 消除无 vsync 全屏重绘的撕裂闪烁 */
+static void begin_frame(void)
+{
+    g_draw_off = (long)(g_cur_frame ^ 1) * FB_W * FB_H;
+}
+
+static void end_frame(void)
+{
+    int target = g_cur_frame ^ 1;
+    char b[32];
+    snprintf(b, sizeof(b), "0,%d", target * FB_H);
+    int fd = open("/sys/class/graphics/fb0/pan", O_WRONLY);
+    int ok = 0;
+    if (fd >= 0) { ok = (write(fd, b, strlen(b)) > 0); close(fd); }
+    if (ok) {
+        g_cur_frame = target;
+    } else {
+        /* 翻页失败则退化为整帧拷贝(慢但正确) */
+        memcpy(g_fb + (long)g_cur_frame * FB_W * FB_H,
+               g_fb + (long)target * FB_W * FB_H,
+               (size_t)FB_W * FB_H * 2);
+    }
 }
 
 /* 横屏逻辑坐标 -> 帧缓冲，4 种可用变换 */
@@ -79,7 +106,7 @@ static inline void px(int sx, int sy, u16 c)
     if (sx < 0 || sx >= SCR_W || sy < 0 || sy >= SCR_H) return;
     int fx, fy;
     s2f(sx, sy, &fx, &fy);
-    long off = g_pan_off + (long)fy * FB_W + fx;   /* 只写当前可见帧 */
+    long off = g_draw_off + (long)fy * FB_W + fx;   /* 只写绘制目标帧 */
     g_fb[off] = c;
 }
 
@@ -415,8 +442,11 @@ static void *weather_thread(void *arg)
             "/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,weather_code",
             g_cfg.lat, g_cfg.lon);
         if (http_get("api.open-meteo.com", path, buf, 8192) == 0) {
-            char *t = strstr(buf, "\"temperature_2m\":");
-            char *c = strstr(buf, "\"weather_code\":");
+            /* 必须从 "current":{ 里找: 前面的 current_units 里也有同名键, 值是 "°C" 字符串 */
+            char *cur = strstr(buf, "\"current\":{");
+            if (!cur) cur = buf;
+            char *t = strstr(cur, "\"temperature_2m\":");
+            char *c = strstr(cur, "\"weather_code\":");
             if (t && c) {
                 int temp = parse_temp(t + 17);
                 int code = atoi(c + 15);
@@ -429,6 +459,31 @@ static void *weather_thread(void *arg)
         sleep(mins * 60);
     }
     return NULL;
+}
+
+/* ==================== 电量(sysfs power_supply) ==================== */
+static int g_batt = -1;      /* 0-100, -1=未知 */
+static int g_charging = 0;
+
+static void battery_poll(void)
+{
+    int fd = open("/sys/class/power_supply/battery/capacity", O_RDONLY);
+    if (fd >= 0) {
+        char b[16];
+        int n = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n > 0) { b[n] = '\0'; g_batt = atoi(b); }
+    }
+    fd = open("/sys/class/power_supply/battery/status", O_RDONLY);
+    if (fd >= 0) {
+        char b[32];
+        int n = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n > 0) {
+            b[n] = '\0';
+            g_charging = (strncmp(b, "Charging", 8) == 0 || strncmp(b, "Full", 4) == 0);
+        }
+    }
 }
 
 /* ==================== 助手字幕(zhiban 的 sair 写文件过来) ==================== */
@@ -689,6 +744,7 @@ static void srow_pm(int i, const char *label, const char *val, u16 bg)
 static void draw_settings(void)
 {
     char buf[32];
+    begin_frame();
     for (int sy = 0; sy < SCR_H; sy++)
         for (int sx = 0; sx < SCR_W; sx++)
             px(sx, sy, rgb565(16, 18, 28));
@@ -718,6 +774,7 @@ static void draw_settings(void)
         srow_label(4, "POWER", "OFF", rgb565(255, 175, 175), rgb565(78, 48, 48));
         srow_label(5, "BACK", "", rgb565(255, 255, 255), rgb565(78, 48, 48));
     }
+    end_frame();
 }
 
 /* ==================== 主程序 ==================== */
@@ -740,7 +797,7 @@ int main(void)
         FILE *lf = fopen("/tmp/desk_fb.log", "w");
         if (lf) {
             fprintf(lf, "FB_W=%d FB_H=%d FB_VH=%d SCR_W=%d SCR_H=%d bpp=%d pan_off=%ld rot=%d\n",
-                    FB_W, FB_H, FB_VH, SCR_W, SCR_H, vi.bits_per_pixel, g_pan_off, g_rotate);
+                    FB_W, FB_H, FB_VH, SCR_W, SCR_H, vi.bits_per_pixel, g_draw_off, g_rotate);
             fclose(lf);
         }
     }
@@ -749,6 +806,7 @@ int main(void)
     touch_start();
     if (font_load("/usr/local/resource/gb2312.ttf", 26) != 0)
         fprintf(stderr, "[desk] 字体加载失败, 中文将不显示\n");
+    battery_poll();
     {
         pthread_t wt;
         if (pthread_create(&wt, NULL, weather_thread, NULL) == 0)
@@ -756,6 +814,7 @@ int main(void)
     }
 
     char last_clock[16] = "", last_weather[80] = "", last_sub[300] = "";
+    int last_batt = -2, last_chg = -1;
     int last_settings = -1, last_brightness = -1, last_hour24 = -1, last_rotate = -1, last_sleep = -1;
     int last_page = -1, last_volume = -1, last_alarm = -1, last_ah = -1, last_am = -1;
     int alarm_fired = 0;
@@ -766,6 +825,7 @@ int main(void)
             tick = 0;
             read_pan();
             subtitle_poll();
+            battery_poll();
             /* 闹钟: 到点唤醒助手出声 */
             {
                 time_t now = time(NULL);
@@ -867,8 +927,7 @@ int main(void)
                 g_cfg.rotate != last_rotate || g_cfg.sleep_min != last_sleep ||
                 g_cfg.volume != last_volume || g_cfg.alarm_on != last_alarm ||
                 g_cfg.alarm_h != last_ah || g_cfg.alarm_m != last_am) {
-                draw_settings();
-                last_settings = g_settings; last_brightness = g_cfg.brightness;
+                draw_settings();                last_settings = g_settings; last_brightness = g_cfg.brightness;
                 last_hour24 = g_cfg.hour24; last_rotate = g_cfg.rotate;
                 last_sleep = g_cfg.sleep_min; last_page = g_settings_page;
                 last_volume = g_cfg.volume; last_alarm = g_cfg.alarm_on;
@@ -882,8 +941,10 @@ int main(void)
             snprintf(clock, sizeof(clock), "%02d:%02d", hour, tm.tm_min);
             snprintf(date, sizeof(date), "%d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
             if (strcmp(clock, last_clock) != 0 || g_settings != last_settings ||
-                strcmp(g_weather, last_weather) != 0 || strcmp(g_subtitle, last_sub) != 0) {
+                strcmp(g_weather, last_weather) != 0 || strcmp(g_subtitle, last_sub) != 0 ||
+                g_batt != last_batt || g_charging != last_chg) {
                 /* 背景渐变 */
+                begin_frame();
                 for (int sy = 0; sy < SCR_H; sy++) {
                     u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
                     for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
@@ -909,10 +970,22 @@ int main(void)
                 /* 右上角设置按钮 */
                 fill_rect(SCR_W - 170, 12, 150, 62, rgb565(255, 140, 0));
                 draw_text("SET", SCR_W - 140, 26, 5, rgb565(0, 0, 0));
+                /* 电量(设置按钮左侧) */
+                if (g_batt >= 0) {
+                    char bb[24];
+                    snprintf(bb, sizeof(bb), "%d%%", g_batt);
+                    int bw = text_width(bb, 5);
+                    draw_text(bb, SCR_W - 190 - bw, 26, 5,
+                              g_batt <= 15 ? rgb565(255, 120, 120) : rgb565(190, 240, 190));
+                    if (g_charging)
+                        draw_text("CHG", SCR_W - 190 - bw - 100, 26, 4, rgb565(255, 220, 120));
+                }
                 strcpy(last_clock, clock);
                 strcpy(last_weather, g_weather);
                 strcpy(last_sub, g_subtitle);
                 last_settings = g_settings;
+                last_batt = g_batt; last_chg = g_charging;
+                end_frame();
             }
         }
         usleep(30000);
