@@ -43,11 +43,25 @@ static inline u16 rgb565(int r, int g, int b)
     return (u16)(((r & 0xf8) << 8) | ((g & 0xfc) << 3) | ((b & 0xf8) >> 3));
 }
 
+/* 旋转方向 0-3（可被 /tmp/desk_rotate 运行时覆盖，方便调试切换） */
+static int g_rotate = 1;
+
+/* 横屏逻辑坐标 -> 帧缓冲，4 种可用变换 */
+static void s2f(int sx, int sy, int *fx, int *fy)
+{
+    switch (g_rotate & 3) {
+    case 0: *fx = sy;            *fy = FB_H - 1 - sx; break;
+    case 1: *fx = FB_W - 1 - sy; *fy = sx;            break;
+    case 2: *fx = sy;            *fy = sx;            break;
+    default:*fx = FB_W - 1 - sy; *fy = FB_H - 1 - sx; break;
+    }
+}
+
 static inline void px(int sx, int sy, u16 c)
 {
     if (sx < 0 || sx >= SCR_W || sy < 0 || sy >= SCR_H) return;
-    int fx = FB_W - 1 - sy;
-    int fy = sx;                     /* 旋转方向(180° 校正版) */
+    int fx, fy;
+    s2f(sx, sy, &fx, &fy);
     long off = (long)fy * FB_W + fx;
     g_fb[off] = c;
     g_fb[off + (long)FB_W * FB_H] = c;
@@ -99,6 +113,7 @@ static void fill_rect(int sx, int sy, int w, int h, u16 c)
 typedef struct {
     int brightness;
     int hour24;
+    int rotate;          /* 屏幕旋转 0-3 */
     char city[32];
     char lat[16];
     char lon[16];
@@ -110,7 +125,7 @@ static pthread_mutex_t g_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void cfg_defaults(void)
 {
-    g_cfg.brightness = 200; g_cfg.hour24 = 1;
+    g_cfg.brightness = 200; g_cfg.hour24 = 1; g_cfg.rotate = 1;
     snprintf(g_cfg.city, sizeof(g_cfg.city), "深圳");
     snprintf(g_cfg.lat, sizeof(g_cfg.lat), "22.5431");
     snprintf(g_cfg.lon, sizeof(g_cfg.lon), "114.0579");
@@ -144,6 +159,7 @@ static void cfg_load(void)
         else if (!strcmp(k, "lat"))    snprintf(g_cfg.lat, sizeof(g_cfg.lat), "%s", v);
         else if (!strcmp(k, "lon"))    snprintf(g_cfg.lon, sizeof(g_cfg.lon), "%s", v);
         else if (!strcmp(k, "refresh"))g_cfg.refresh_min = atoi(v);
+        else if (!strcmp(k, "rotate")) g_cfg.rotate = atoi(v) & 3;
     }
     fclose(f);
     if (g_cfg.brightness < 10)  g_cfg.brightness = 10;
@@ -163,6 +179,7 @@ static void cfg_save(void)
     fprintf(f, "lat=%s\n", g_cfg.lat);
     fprintf(f, "lon=%s\n", g_cfg.lon);
     fprintf(f, "refresh=%d\n", g_cfg.refresh_min);
+    fprintf(f, "rotate=%d\n", g_cfg.rotate);
     fclose(f);
 }
 
@@ -212,8 +229,12 @@ static void touch_start(void)
 /* 原始触摸坐标 -> 横屏坐标（与 px 旋转同款，待校准） */
 static void raw_to_screen(int tx, int ty, int *sx, int *sy)
 {
-    *sx = ty;
-    *sy = FB_W - 1 - tx;
+    switch (g_rotate & 3) {
+    case 0: *sx = FB_H - 1 - ty; *sy = tx;            break;
+    case 1: *sx = ty;            *sy = FB_W - 1 - tx; break;
+    case 2: *sx = ty;            *sy = tx;            break;
+    default:*sx = FB_W - 1 - ty; *sy = FB_H - 1 - tx; break;
+    }
 }
 
 /* ==================== HTTP（保留，远程备用） ==================== */
@@ -383,14 +404,29 @@ int main(void)
     if (g_fb == MAP_FAILED) { perror("mmap"); return 1; }
 
     cfg_load();
+    g_rotate = g_cfg.rotate & 3;
     sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
     httpd_start();
     touch_start();
 
     char last_clock[16] = "";
     int last_settings = -1, last_brightness = -1, last_hour24 = -1;
-    int last_press = 0;
+    int last_press = 0, tick = 0;
     for (;;) {
+        /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
+        if (++tick >= 30) {
+            tick = 0;
+            int rfd = open("/tmp/desk_rotate", O_RDONLY);
+            if (rfd >= 0) {
+                char rb[8]; int rn = read(rfd, rb, sizeof(rb) - 1); close(rfd);
+                if (rn > 0) {
+                    rb[rn] = '\0'; int rv = atoi(rb);
+                    if (rv >= 0 && rv <= 3 && rv != g_rotate) {
+                        g_rotate = rv; last_clock[0] = '\0'; last_settings = -1;
+                    }
+                }
+            }
+        }
         /* 处理按键 */
         int key = g_key_event;
         if (key) {
