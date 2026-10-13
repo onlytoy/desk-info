@@ -970,15 +970,15 @@ int main(void)
                 }
                 /* 底部字幕条(zhiban 助手 TTS 文本) */
                 if (g_subtitle[0]) {
-                    for (int sy = 336; sy < SCR_H; sy++)
+                    for (int sy = 348; sy < SCR_H; sy++)
                         for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, rgb565(26, 34, 56));
-                    for (int sx = 0; sx < SCR_W; sx++) px(sx, 336, rgb565(70, 110, 180));
-                    draw_utf8(g_subtitle, 22, 352, rgb565(214, 232, 255));
+                    for (int sx = 0; sx < SCR_W; sx++) px(sx, 348, rgb565(70, 110, 180));
+                    draw_utf8(g_subtitle, 22, 388, rgb565(214, 232, 255));
                 }
-                /* 大时钟(居中偏上) */
+                /* 大时钟(固定位置, 不因子幕出现而上移) */
                 int scale = 22;
                 int cw = text_width(clock, scale);
-                int cy = g_subtitle[0] ? 66 : 96;
+                int cy = 88;
                 draw_text(clock, (SCR_W - cw)/2, cy, scale, rgb565(255, 255, 255));
                 /* 日期 */
                 int dw = text_width(date, 6);
