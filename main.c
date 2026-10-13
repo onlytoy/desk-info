@@ -138,6 +138,14 @@ static void draw_char(char ch, int sx, int sy, int scale, u16 color)
         }
 }
 
+/* 只算文字宽度(不画) — 避免"量宽度"时把黑字画在屏上 */
+static int text_width(const char *s, int scale)
+{
+    int w = 0;
+    for (; *s; s++) w += (*s == ' ') ? 3 * scale : 6 * scale;
+    return w;
+}
+
 static int draw_text(const char *s, int sx, int sy, int scale, u16 color)
 {
     int x = sx;
@@ -420,7 +428,7 @@ static void draw_settings(void)
     fill_rect(BTN_BRIGHT_MIN.x, BTN_BRIGHT_MIN.y, BTN_BRIGHT_MIN.w, BTN_BRIGHT_MIN.h, rgb565(60,60,90));
     draw_text("-", BTN_BRIGHT_MIN.x + 55, BTN_BRIGHT_MIN.y + 35, 8, rgb565(255,255,255));
     char b[16]; snprintf(b, sizeof(b), "%d", g_cfg.brightness);
-    int w = draw_text(b, 0, 0, 6, rgb565(0,0,0));
+    int w = text_width(b, 6);
     draw_text(b, (SCR_W - w)/2, 60 + 35, 6, rgb565(255,255,255));
     fill_rect(BTN_BRIGHT_PLUS.x, BTN_BRIGHT_PLUS.y, BTN_BRIGHT_PLUS.w, BTN_BRIGHT_PLUS.h, rgb565(60,60,90));
     draw_text("+", BTN_BRIGHT_PLUS.x + 55, BTN_BRIGHT_PLUS.y + 35, 8, rgb565(255,255,255));
@@ -530,11 +538,11 @@ int main(void)
                 }
                 /* 大时钟(居中) */
                 int scale = 24;
-                int cw = draw_text(clock, 0, 0, scale, rgb565(0,0,0));
+                int cw = text_width(clock, scale);
                 int cy = (SCR_H - 7*scale)/2 - 20;
                 draw_text(clock, (SCR_W - cw)/2, cy, scale, rgb565(255,255,255));
                 /* 日期 */
-                int dw = draw_text(date, 0, 0, 6, rgb565(0,0,0));
+                int dw = text_width(date, 6);
                 draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 18, 6, rgb565(180,200,255));
                 /* 右上角设置按钮 */
                 fill_rect(SCR_W - 180, 12, 160, 70, rgb565(255,140,0));
