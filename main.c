@@ -437,11 +437,13 @@ static void *weather_thread(void *arg)
     char *buf = (char *)malloc(8192);
     if (!buf) return NULL;
     for (;;) {
+        int got = 0;
         char path[256];
         snprintf(path, sizeof(path),
             "/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,weather_code",
             g_cfg.lat, g_cfg.lon);
-        if (http_get("api.open-meteo.com", path, buf, 8192) == 0) {
+        int rc = http_get("api.open-meteo.com", path, buf, 8192);
+        if (rc == 0) {
             /* 必须从 "current":{ 里找: 前面的 current_units 里也有同名键, 值是 "°C" 字符串 */
             char *cur = strstr(buf, "\"current\":{");
             if (!cur) cur = buf;
@@ -453,10 +455,23 @@ static void *weather_thread(void *arg)
                 snprintf(g_weather, sizeof(g_weather), "%s %s %dC",
                          g_cfg.city, wmo_desc(code), temp);
                 g_weather_ok = 1;
+                got = 1;
             }
         }
-        int mins = g_cfg.refresh_min > 0 ? g_cfg.refresh_min : 30;
-        sleep(mins * 60);
+        {
+            FILE *lf = fopen("/tmp/desk_weather.log", "w");
+            if (lf) {
+                fprintf(lf, "rc=%d ok=%d weather=%s\n", rc, got, g_weather);
+                if (rc == 0) fprintf(lf, "body: %.500s\n", buf);
+                fclose(lf);
+            }
+        }
+        if (got) {
+            int mins = g_cfg.refresh_min > 0 ? g_cfg.refresh_min : 30;
+            sleep(mins * 60);
+        } else {
+            sleep(20);   /* 拉取失败 20 秒后重试, 避免一直空着 */
+        }
     }
     return NULL;
 }
