@@ -22,14 +22,19 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <linux/fb.h>
 #include <linux/input.h>
+
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 
 typedef unsigned short u16;
 
 #define HTTP_PORT      9000
 #define CFG_PATH       "/var/upgrade/desk.conf"
 #define BL_BRIGHTNESS  "/sys/class/backlight/owl_backlight/brightness"
+#define BL_POWER       "/sys/class/backlight/owl_backlight/bl_power"
 #define TOUCH_DEV      "/dev/input/event2"
 #define TOUCH_LOG      "/tmp/touch.log"
 
@@ -159,6 +164,88 @@ static int draw_text(const char *s, int sx, int sy, int scale, u16 color)
     return x - sx;
 }
 
+/* ==================== 中文字体(stb_truetype + gb2312.ttf) ==================== */
+static unsigned char *g_font_data = NULL;
+static stbtt_fontinfo g_font;
+static float g_font_scale = 0;
+static int g_font_px = 24;
+
+static int font_load(const char *path, int px)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0) { fclose(f); return -1; }
+    g_font_data = (unsigned char *)malloc(sz);
+    if (!g_font_data) { fclose(f); return -1; }
+    if (fread(g_font_data, 1, sz, f) != (size_t)sz) { fclose(f); free(g_font_data); g_font_data = NULL; return -1; }
+    fclose(f);
+    if (!stbtt_InitFont(&g_font, g_font_data, stbtt_GetFontOffsetForIndex(g_font_data, 0)))
+        return -1;
+    g_font_px = px;
+    g_font_scale = stbtt_ScaleForPixelHeight(&g_font, (float)px);
+    return 0;
+}
+
+static unsigned int utf8_next(const char **s)
+{
+    const unsigned char *p = (const unsigned char *)*s;
+    unsigned int cp;
+    if (p[0] < 0x80) { cp = p[0]; *s += 1; }
+    else if ((p[0] & 0xE0) == 0xC0) { cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F); *s += 2; }
+    else if ((p[0] & 0xF0) == 0xE0) { cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F); *s += 3; }
+    else if ((p[0] & 0xF8) == 0xF0) { cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); *s += 4; }
+    else { cp = '?'; *s += 1; }
+    return cp;
+}
+
+/* 用 TTF 渲染 UTF-8 文本(支持中文), (x,y) 为左上角 */
+static void draw_utf8(const char *s, int x, int y, u16 color)
+{
+    if (!g_font_data || g_font_scale <= 0) return;
+    int ascent, descent, lineGap;
+    stbtt_GetFontVMetrics(&g_font, &ascent, &descent, &lineGap);
+    int base = y + (int)(ascent * g_font_scale);
+    int cx = x;
+    while (*s) {
+        unsigned int cp = utf8_next(&s);
+        if (cp == '\n') { cx = x; base += (int)((ascent - descent + lineGap) * g_font_scale); continue; }
+        int adv = 0, lsb = 0;
+        stbtt_GetCodepointHMetrics(&g_font, cp, &adv, &lsb);
+        int x0, y0, x1, y1;
+        stbtt_GetCodepointBitmapBox(&g_font, cp, g_font_scale, g_font_scale, &x0, &y0, &x1, &y1);
+        int w = x1 - x0, h = y1 - y0;
+        if (w > 0 && h > 0) {
+            int gw = w, gh = h;
+            unsigned char *bmp = stbtt_GetCodepointBitmap(&g_font, 0, g_font_scale, cp, &gw, &gh, 0, 0);
+            if (bmp) {
+                for (int gy = 0; gy < gh; gy++)
+                    for (int gx = 0; gx < gw; gx++)
+                        if (bmp[gy * gw + gx] > 110)
+                            px(cx + x0 + gx, base + y0 + gy, color);
+                stbtt_FreeBitmap(bmp, 0);
+            }
+        }
+        cx += (int)(adv * g_font_scale);
+    }
+}
+
+/* UTF-8 文本宽度(像素) */
+static int utf8_width(const char *s)
+{
+    if (!g_font_data || g_font_scale <= 0) return 0;
+    int w = 0;
+    while (*s) {
+        unsigned int cp = utf8_next(&s);
+        int adv = 0, lsb = 0;
+        stbtt_GetCodepointHMetrics(&g_font, cp, &adv, &lsb);
+        w += (int)(adv * g_font_scale);
+    }
+    return w;
+}
+
 static void fill_rect(int sx, int sy, int w, int h, u16 c)
 {
     for (int y = sy; y < sy + h; y++)
@@ -171,6 +258,7 @@ typedef struct {
     int brightness;
     int hour24;
     int rotate;          /* 屏幕旋转 0-3 */
+    int sleep_min;       /* 无操作多少分钟后息屏, 0=不息屏 */
     char city[32];
     char lat[16];
     char lon[16];
@@ -182,7 +270,7 @@ static pthread_mutex_t g_cfg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void cfg_defaults(void)
 {
-    g_cfg.brightness = 200; g_cfg.hour24 = 1; g_cfg.rotate = 1;
+    g_cfg.brightness = 200; g_cfg.hour24 = 1; g_cfg.rotate = 1; g_cfg.sleep_min = 0;
     snprintf(g_cfg.city, sizeof(g_cfg.city), "深圳");
     snprintf(g_cfg.lat, sizeof(g_cfg.lat), "22.5431");
     snprintf(g_cfg.lon, sizeof(g_cfg.lon), "114.0579");
@@ -217,6 +305,7 @@ static void cfg_load(void)
         else if (!strcmp(k, "lon"))    snprintf(g_cfg.lon, sizeof(g_cfg.lon), "%s", v);
         else if (!strcmp(k, "refresh"))g_cfg.refresh_min = atoi(v);
         else if (!strcmp(k, "rotate")) g_cfg.rotate = atoi(v) & 3;
+        else if (!strcmp(k, "sleep"))  g_cfg.sleep_min = atoi(v);
     }
     fclose(f);
     if (g_cfg.brightness < 10)  g_cfg.brightness = 10;
@@ -237,7 +326,117 @@ static void cfg_save(void)
     fprintf(f, "lon=%s\n", g_cfg.lon);
     fprintf(f, "refresh=%d\n", g_cfg.refresh_min);
     fprintf(f, "rotate=%d\n", g_cfg.rotate);
+    fprintf(f, "sleep=%d\n", g_cfg.sleep_min);
     fclose(f);
+}
+
+/* ==================== 天气(明文 HTTP + Open-Meteo) ==================== */
+static char g_weather[80] = "";
+static volatile int g_weather_ok = 0;
+
+/* 极简 HTTP GET: body 取出到 out(响应头丢弃) */
+static int http_get(const char *host, const char *path, char *out, int out_sz)
+{
+    struct hostent *he = gethostbyname(host);
+    if (!he) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(80);
+    memcpy(&a.sin_addr, he->h_addr, he->h_length);
+    struct timeval tv; tv.tv_sec = 10; tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0) { close(fd); return -1; }
+    char req[512];
+    int rl = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: desk-info\r\nConnection: close\r\n\r\n",
+        path, host);
+    if (send(fd, req, rl, 0) < 0) { close(fd); return -1; }
+    int total = 0, n;
+    while (total < out_sz - 1 && (n = recv(fd, out + total, out_sz - 1 - total, 0)) > 0)
+        total += n;
+    close(fd);
+    out[total] = '\0';
+    char *body = strstr(out, "\r\n\r\n");
+    if (!body) return -1;
+    body += 4;
+    int bl = (int)strlen(body);
+    memmove(out, body, bl + 1);
+    return 0;
+}
+
+static const char *wmo_desc(int c)
+{
+    if (c == 0) return "晴";
+    if (c <= 2) return "多云";
+    if (c == 3) return "阴";
+    if (c == 45 || c == 48) return "雾";
+    if (c >= 51 && c <= 57) return "毛毛雨";
+    if (c >= 61 && c <= 67) return "雨";
+    if (c >= 71 && c <= 77) return "雪";
+    if (c >= 80 && c <= 82) return "阵雨";
+    if (c >= 85 && c <= 86) return "阵雪";
+    if (c >= 95) return "雷雨";
+    return "未知";
+}
+
+/* 温度四舍五入取整(不引入浮点, 软浮点调设备硬浮点 libm 会出错) */
+static int parse_temp(const char *p)
+{
+    int v = atoi(p);
+    const char *dot = strchr(p, '.');
+    if (dot && dot[1] >= '5') { if (v < 0) v--; else v++; }
+    return v;
+}
+
+static void *weather_thread(void *arg)
+{
+    (void)arg;
+    char *buf = (char *)malloc(8192);
+    if (!buf) return NULL;
+    for (;;) {
+        char path[256];
+        snprintf(path, sizeof(path),
+            "/v1/forecast?latitude=%s&longitude=%s&current=temperature_2m,weather_code",
+            g_cfg.lat, g_cfg.lon);
+        if (http_get("api.open-meteo.com", path, buf, 8192) == 0) {
+            char *t = strstr(buf, "\"temperature_2m\":");
+            char *c = strstr(buf, "\"weather_code\":");
+            if (t && c) {
+                int temp = parse_temp(t + 17);
+                int code = atoi(c + 15);
+                snprintf(g_weather, sizeof(g_weather), "%s %s %dC",
+                         g_cfg.city, wmo_desc(code), temp);
+                g_weather_ok = 1;
+            }
+        }
+        int mins = g_cfg.refresh_min > 0 ? g_cfg.refresh_min : 30;
+        sleep(mins * 60);
+    }
+    return NULL;
+}
+
+/* ==================== 助手字幕(zhiban 的 sair 写文件过来) ==================== */
+#define SUBTITLE_PATH "/tmp/sair_subtitle.txt"
+static char g_subtitle[300] = "";
+
+static void subtitle_poll(void)
+{
+    int fd = open(SUBTITLE_PATH, O_RDONLY);
+    if (fd < 0) return;
+    char b[sizeof(g_subtitle)];
+    int n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n < 0) n = 0;
+    b[n] = '\0';
+    while (n > 0 && (b[n - 1] == '\n' || b[n - 1] == '\r')) b[--n] = '\0';
+    if (strcmp(b, g_subtitle) != 0) {
+        strncpy(g_subtitle, b, sizeof(g_subtitle) - 1);
+        g_subtitle[sizeof(g_subtitle) - 1] = '\0';
+    }
 }
 
 /* ==================== 触控 ==================== */
@@ -411,45 +610,84 @@ static void httpd_start(void)
 
 /* ==================== 设置界面 ==================== */
 static int g_settings = 0;
+static time_t g_last_active = 0;   /* 最近一次触摸时刻(息屏计时) */
+static int g_screen_off = 0;
 
-typedef struct { int x, y, w, h; } btn_t;
+#define SROW_N  6
+#define SROW_H  74
+static const int SROW_Y[SROW_N] = { 10, 84, 158, 232, 306, 380 };
 
-/* 设置页按钮布局（横屏 800x480） */
-#define BTN_BRIGHT_MIN  (btn_t){50, 60, 140, 100}
-#define BTN_BRIGHT_PLUS (btn_t){700, 60, 140, 100}
-#define BTN_HOUR24      (btn_t){50, 220, 700, 80}
-#define BTN_BACK        (btn_t){50, 360, 700, 80}
-
-static int hit(btn_t b, int sx, int sy)
+static int hit_row(int sy)
 {
-    return sx >= b.x && sx < b.x + b.w && sy >= b.y && sy < b.y + b.h;
+    for (int i = 0; i < SROW_N; i++)
+        if (sy >= SROW_Y[i] && sy < SROW_Y[i] + SROW_H - 6) return i;
+    return -1;
+}
+
+static void cycle_sleep(void)
+{
+    static const int v[] = {0, 1, 5, 15, 30, 60, 120};
+    int i; for (i = 0; i < 7; i++) if (v[i] == g_cfg.sleep_min) break;
+    g_cfg.sleep_min = v[(i + 1) % 7];
+}
+
+static void cycle_refresh(void)
+{
+    static const int v[] = {5, 10, 15, 30, 60, 120};
+    int i; for (i = 0; i < 6; i++) if (v[i] == g_cfg.refresh_min) break;
+    g_cfg.refresh_min = v[(i + 1) % 6];
 }
 
 static void draw_settings(void)
 {
+    char buf[32];
     for (int sy = 0; sy < SCR_H; sy++)
         for (int sx = 0; sx < SCR_W; sx++)
-            px(sx, sy, rgb565(18, 20, 30));
+            px(sx, sy, rgb565(16, 18, 28));
 
-    /* 亮度行 */
-    fill_rect(BTN_BRIGHT_MIN.x, BTN_BRIGHT_MIN.y, BTN_BRIGHT_MIN.w, BTN_BRIGHT_MIN.h, rgb565(60,60,90));
-    draw_text("-", BTN_BRIGHT_MIN.x + 55, BTN_BRIGHT_MIN.y + 35, 8, rgb565(255,255,255));
-    char b[16]; snprintf(b, sizeof(b), "%d", g_cfg.brightness);
-    int w = text_width(b, 6);
-    draw_text(b, (SCR_W - w)/2, 60 + 35, 6, rgb565(255,255,255));
-    fill_rect(BTN_BRIGHT_PLUS.x, BTN_BRIGHT_PLUS.y, BTN_BRIGHT_PLUS.w, BTN_BRIGHT_PLUS.h, rgb565(60,60,90));
-    draw_text("+", BTN_BRIGHT_PLUS.x + 55, BTN_BRIGHT_PLUS.y + 35, 8, rgb565(255,255,255));
+    /* 行1 亮度: [-] value [+] */
+    int y = SROW_Y[0];
+    fill_rect(20, y, 130, SROW_H - 10, rgb565(60, 60, 95));
+    draw_text("-", 70, y + 20, 7, rgb565(255, 255, 255));
+    snprintf(buf, sizeof(buf), "%d", g_cfg.brightness);
+    int w = text_width(buf, 7);
+    draw_text(buf, (SCR_W - w) / 2, y + 14, 7, rgb565(255, 255, 255));
+    fill_rect(SCR_W - 150, y, 130, SROW_H - 10, rgb565(60, 60, 95));
+    draw_text("+", SCR_W - 100, y + 20, 7, rgb565(255, 255, 255));
 
-    /* 24小时制 */
-    fill_rect(BTN_HOUR24.x, BTN_HOUR24.y, BTN_HOUR24.w, BTN_HOUR24.h, rgb565(50,50,70));
-    draw_text("24H", BTN_HOUR24.x + 30, BTN_HOUR24.y + 20, 6, rgb565(255,255,255));
-    const char *st = g_cfg.hour24 ? "ON" : "OFF";
-    draw_text(st, BTN_HOUR24.x + BTN_HOUR24.w - 200, BTN_HOUR24.y + 20, 6,
-              g_cfg.hour24 ? rgb565(127,224,160) : rgb565(200,120,120));
+    /* 行2 24小时制 */
+    y = SROW_Y[1];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
+    draw_text("24H", 40, y + 20, 6, rgb565(255, 255, 255));
+    draw_text(g_cfg.hour24 ? "ON" : "OFF", SCR_W - 170, y + 20, 6,
+              g_cfg.hour24 ? rgb565(127, 224, 160) : rgb565(210, 130, 130));
 
-    /* 返回 */
-    fill_rect(BTN_BACK.x, BTN_BACK.y, BTN_BACK.w, BTN_BACK.h, rgb565(70,50,50));
-    draw_text("BACK", BTN_BACK.x + 30, BTN_BACK.y + 20, 6, rgb565(255,255,255));
+    /* 行3 息屏 */
+    y = SROW_Y[2];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
+    draw_text("SLEEP", 40, y + 20, 6, rgb565(255, 255, 255));
+    if (g_cfg.sleep_min == 0) snprintf(buf, sizeof(buf), "OFF");
+    else snprintf(buf, sizeof(buf), "%dM", g_cfg.sleep_min);
+    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
+
+    /* 行4 旋转 */
+    y = SROW_Y[3];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
+    draw_text("ROTATE", 40, y + 20, 6, rgb565(255, 255, 255));
+    snprintf(buf, sizeof(buf), "%d", g_cfg.rotate);
+    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
+
+    /* 行5 天气刷新 */
+    y = SROW_Y[4];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(45, 48, 68));
+    draw_text("REFRESH", 40, y + 20, 6, rgb565(255, 255, 255));
+    snprintf(buf, sizeof(buf), "%dM", g_cfg.refresh_min);
+    draw_text(buf, SCR_W - 170, y + 20, 6, rgb565(225, 220, 130));
+
+    /* 行6 返回 */
+    y = SROW_Y[5];
+    fill_rect(20, y, SCR_W - 40, SROW_H - 10, rgb565(75, 48, 48));
+    draw_text("BACK", 40, y + 20, 6, rgb565(255, 255, 255));
 }
 
 /* ==================== 主程序 ==================== */
@@ -479,15 +717,29 @@ int main(void)
     sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
     httpd_start();
     touch_start();
+    if (font_load("/usr/local/resource/gb2312.ttf", 26) != 0)
+        fprintf(stderr, "[desk] 字体加载失败, 中文将不显示\n");
+    {
+        pthread_t wt;
+        if (pthread_create(&wt, NULL, weather_thread, NULL) == 0)
+            pthread_detach(wt);
+    }
 
-    char last_clock[16] = "";
-    int last_settings = -1, last_brightness = -1, last_hour24 = -1;
+    char last_clock[16] = "", last_weather[80] = "", last_sub[300] = "";
+    int last_settings = -1, last_brightness = -1, last_hour24 = -1, last_rotate = -1, last_sleep = -1;
     int tick = 0;
     for (;;) {
         /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
         if (++tick >= 30) {
             tick = 0;
             read_pan();
+            subtitle_poll();
+            /* 息屏: 无操作超过 sleep_min 分钟则关背光 */
+            if (g_cfg.sleep_min > 0 && !g_screen_off && g_last_active &&
+                time(NULL) - g_last_active >= g_cfg.sleep_min * 60) {
+                sysfs_write_int(BL_POWER, 1);
+                g_screen_off = 1;
+            }
             int rfd = open("/tmp/desk_rotate", O_RDONLY);
             if (rfd >= 0) {
                 char rb[8]; int rn = read(rfd, rb, sizeof(rb) - 1); close(rfd);
@@ -512,11 +764,26 @@ int main(void)
         if (g_tap) {
             g_tap = 0;
             int sx, sy; raw_to_screen(g_tap_x, g_tap_y, &sx, &sy);
-            if (g_settings) {
-                if (hit(BTN_BRIGHT_MIN, sx, sy)) { g_cfg.brightness -= 20; if(g_cfg.brightness<10)g_cfg.brightness=10; sysfs_write_int(BL_BRIGHTNESS,g_cfg.brightness); cfg_save(); }
-                else if (hit(BTN_BRIGHT_PLUS, sx, sy)) { g_cfg.brightness += 20; if(g_cfg.brightness>900)g_cfg.brightness=900; sysfs_write_int(BL_BRIGHTNESS,g_cfg.brightness); cfg_save(); }
-                else if (hit(BTN_HOUR24, sx, sy)) { g_cfg.hour24 = !g_cfg.hour24; cfg_save(); }
-                else if (hit(BTN_BACK, sx, sy)) g_settings = 0;
+            g_last_active = time(NULL);
+            if (g_screen_off) {                 /* 息屏时首次触摸: 只亮屏 */
+                sysfs_write_int(BL_POWER, 0);
+                sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
+                g_screen_off = 0;
+            } else if (g_settings) {
+                int row = hit_row(sy);
+                if (row == 0) {
+                    int hitb = 0;
+                    if (sx < 200) { g_cfg.brightness -= 30; hitb = 1; }
+                    else if (sx > SCR_W - 200) { g_cfg.brightness += 30; hitb = 1; }
+                    if (g_cfg.brightness < 10) g_cfg.brightness = 10;
+                    if (g_cfg.brightness > 900) g_cfg.brightness = 900;
+                    if (hitb) { sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness); cfg_save(); }
+                }
+                else if (row == 1) { g_cfg.hour24 = !g_cfg.hour24; cfg_save(); }
+                else if (row == 2) { cycle_sleep(); cfg_save(); }
+                else if (row == 3) { g_cfg.rotate = (g_cfg.rotate + 1) & 3; g_rotate = g_cfg.rotate; cfg_save(); }
+                else if (row == 4) { cycle_refresh(); cfg_save(); }
+                else if (row == 5) { g_settings = 0; }
             } else {
                 /* 时钟界面：右上角设置按钮 */
                 if (sx > SCR_W - 200 && sy < 100) g_settings = 1;
@@ -526,9 +793,12 @@ int main(void)
         /* 按需重绘(内容变化才画, 避免全屏高频无 vsync 撕裂闪烁) */
         if (g_settings) {
             if (g_settings != last_settings || g_cfg.brightness != last_brightness ||
-                g_cfg.hour24 != last_hour24) {
+                g_cfg.hour24 != last_hour24 || g_cfg.rotate != last_rotate ||
+                g_cfg.sleep_min != last_sleep) {
                 draw_settings();
-                last_settings = g_settings; last_brightness = g_cfg.brightness; last_hour24 = g_cfg.hour24;
+                last_settings = g_settings; last_brightness = g_cfg.brightness;
+                last_hour24 = g_cfg.hour24; last_rotate = g_cfg.rotate;
+                last_sleep = g_cfg.sleep_min;
             }
         } else {
             time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
@@ -537,24 +807,37 @@ int main(void)
             char clock[16], date[40];
             snprintf(clock, sizeof(clock), "%02d:%02d", hour, tm.tm_min);
             snprintf(date, sizeof(date), "%d-%02d-%02d", tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday);
-            if (strcmp(clock, last_clock) != 0 || g_settings != last_settings) {
+            if (strcmp(clock, last_clock) != 0 || g_settings != last_settings ||
+                strcmp(g_weather, last_weather) != 0 || strcmp(g_subtitle, last_sub) != 0) {
                 /* 背景渐变 */
                 for (int sy = 0; sy < SCR_H; sy++) {
                     u16 c = rgb565(14, 18 + sy/14, 34 + sy/7);
                     for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, c);
                 }
-                /* 大时钟(居中) */
-                int scale = 24;
+                /* 底部字幕条(zhiban 助手 TTS 文本) */
+                if (g_subtitle[0]) {
+                    for (int sy = 336; sy < SCR_H; sy++)
+                        for (int sx = 0; sx < SCR_W; sx++) px(sx, sy, rgb565(26, 34, 56));
+                    for (int sx = 0; sx < SCR_W; sx++) px(sx, 336, rgb565(70, 110, 180));
+                    draw_utf8(g_subtitle, 22, 352, rgb565(214, 232, 255));
+                }
+                /* 大时钟(居中偏上) */
+                int scale = 22;
                 int cw = text_width(clock, scale);
-                int cy = (SCR_H - 7*scale)/2 - 20;
-                draw_text(clock, (SCR_W - cw)/2, cy, scale, rgb565(255,255,255));
+                int cy = g_subtitle[0] ? 66 : 96;
+                draw_text(clock, (SCR_W - cw)/2, cy, scale, rgb565(255, 255, 255));
                 /* 日期 */
                 int dw = text_width(date, 6);
-                draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 18, 6, rgb565(180,200,255));
+                draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 14, 6, rgb565(180, 200, 255));
+                /* 天气(左下, 中文) */
+                if (g_weather_ok)
+                    draw_utf8(g_weather, 24, 200, rgb565(150, 210, 255));
                 /* 右上角设置按钮 */
-                fill_rect(SCR_W - 180, 12, 160, 70, rgb565(255,140,0));
-                draw_text("SET", SCR_W - 150, 32, 5, rgb565(0,0,0));
+                fill_rect(SCR_W - 170, 12, 150, 62, rgb565(255, 140, 0));
+                draw_text("SET", SCR_W - 140, 26, 5, rgb565(0, 0, 0));
                 strcpy(last_clock, clock);
+                strcpy(last_weather, g_weather);
+                strcpy(last_sub, g_subtitle);
                 last_settings = g_settings;
             }
         }
