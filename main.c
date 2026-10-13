@@ -493,7 +493,10 @@ static char g_subtitle[300] = "";
 static void subtitle_poll(void)
 {
     int fd = open(SUBTITLE_PATH, O_RDONLY);
-    if (fd < 0) return;
+    if (fd < 0) {                       /* 文件不存在 = 无字幕(助手没在说话) */
+        g_subtitle[0] = '\0';
+        return;
+    }
     char b[sizeof(g_subtitle)];
     int n = read(fd, b, sizeof(b) - 1);
     close(fd);
@@ -807,6 +810,7 @@ int main(void)
     if (font_load("/usr/local/resource/gb2312.ttf", 26) != 0)
         fprintf(stderr, "[desk] 字体加载失败, 中文将不显示\n");
     battery_poll();
+    unlink(SUBTITLE_PATH);   /* 清掉上次残留的字幕 */
     {
         pthread_t wt;
         if (pthread_create(&wt, NULL, weather_thread, NULL) == 0)
