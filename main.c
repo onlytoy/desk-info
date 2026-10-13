@@ -300,7 +300,7 @@ static void draw_utf8_centered(const char *s, int y, u16 color)
     int w1 = utf8_width(l1), w2 = utf8_width(l2);
     int x1 = (SCR_W - w1) / 2; if (x1 < 10) x1 = 10;
     int x2 = (SCR_W - w2) / 2; if (x2 < 10) x2 = 10;
-    draw_utf8(l1, x1, y - 20, color);
+    draw_utf8(l1, x1, y - 22, color);
     draw_utf8(l2, x2, y + 22, color);
 }
 
@@ -1001,15 +1001,15 @@ int main(void)
                 }
                 /* 底部字幕(助手 TTS 文本): 居中, 不加背景块/分割线 */
                 if (g_subtitle[0])
-                    draw_utf8_centered(g_subtitle, 400, rgb565(214, 232, 255));
+                    draw_utf8_centered(g_subtitle, 352, rgb565(214, 232, 255));
                 /* 大时钟(固定位置, 不因子幕出现而上移) */
-                int scale = 22;
+                int scale = 25;
                 int cw = text_width(clock, scale);
-                int cy = 88;
+                int cy = 78;
                 draw_text(clock, (SCR_W - cw)/2, cy, scale, rgb565(255, 255, 255));
                 /* 日期 */
                 int dw = text_width(date, 6);
-                draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 14, 6, rgb565(180, 200, 255));
+                draw_text(date, (SCR_W - dw)/2, cy + 7*scale + 12, 6, rgb565(180, 200, 255));
                 /* 天气(左上角, 中文) */
                 if (g_weather_ok)
                     draw_utf8(g_weather, 24, 14, rgb565(150, 210, 255));
