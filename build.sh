@@ -11,6 +11,7 @@ mkdir -p "$BUILD_DIR"
 echo "CC: $CC"
 "$CC" -static -Os -mcpu=cortex-a5 -mfloat-abi=soft \
     -I"$SCRIPT_DIR" \
-    -o "$BUILD_DIR/desk-info" "$SCRIPT_DIR/main.c" -lpthread -lm
-echo "built: $BUILD_DIR/desk-info"
-ls -la "$BUILD_DIR/desk-info"
+    -o "$BUILD_DIR/xwplug-desk" "$SCRIPT_DIR/main.c" -lpthread -lm
+cp -f "$BUILD_DIR/xwplug-desk" "$BUILD_DIR/desk-info"
+echo "built: $BUILD_DIR/xwplug-desk (alias desk-info)"
+ls -la "$BUILD_DIR/xwplug-desk"

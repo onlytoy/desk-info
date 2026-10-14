@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -724,6 +725,40 @@ static void httpd_start(void)
     pthread_create(&t, &a, httpd_thread, NULL); pthread_attr_destroy(&a);
 }
 
+/* ==================== 面板插件形态(xwplug) ==================== */
+/* xwebd 插件网关: 插件名 = 二进制 xwplug-<name>, 监听 /tmp/xwplug/<name>.sock。
+ * 网关 probe_sock 只 connect 探测在线; /api/plugin/<name>/<sub> 会转发成 GET /<sub>。
+ * 复用 http_handle: / (状态页) 与 /config (读写配置) 都可用。 */
+#define PLUG_NAME "desk"
+#define PLUG_SOCK "/tmp/xwplug/" PLUG_NAME ".sock"
+
+static void *plug_thread(void *arg)
+{
+    (void)arg;
+    mkdir("/tmp/xwplug", 0755);
+    unlink(PLUG_SOCK);
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) return NULL;
+    struct sockaddr_un a; memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, PLUG_SOCK, sizeof(a.sun_path) - 1);
+    if (bind(srv, (struct sockaddr *)&a, sizeof(a)) < 0) { close(srv); return NULL; }
+    listen(srv, 4);
+    for (;;) {
+        int c = accept(srv, NULL, NULL);
+        if (c < 0) { usleep(50000); continue; }
+        http_handle(c);
+        close(c);
+    }
+    return NULL;
+}
+
+static void plug_start(void)
+{
+    pthread_t t; pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64*1024);
+    pthread_create(&t, &a, plug_thread, NULL); pthread_attr_destroy(&a);
+}
+
 /* ==================== 设置界面（2 页） ==================== */
 static int g_settings = 0;
 static int g_settings_page = 0;    /* 0=主页 1=更多 */
@@ -851,7 +886,10 @@ int main(void)
         }
     }
     sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
+    /* 停止原厂桌面(launcher), 本程序接管屏幕 */
+    system("killall launcher 2>/dev/null");
     httpd_start();
+    plug_start();
     touch_start();
     if (font_load("/usr/local/resource/gb2312.ttf", 26) != 0)
         fprintf(stderr, "[desk] 字体加载失败, 中文将不显示\n");

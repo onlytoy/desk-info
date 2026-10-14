@@ -31,5 +31,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: desk-info
-          path: build/desk-info
+          path: |
+            build/xwplug-desk
+            build/desk-info
           if-no-files-found: error
