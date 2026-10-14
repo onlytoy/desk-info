@@ -1,0 +1,43 @@
+name: disassemble-launcher
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 're/**'
+      - '.github/workflows/re.yml'
+
+jobs:
+  disasm:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 ARM 工具链
+        run: |
+          mkdir -p toolchain
+          cd toolchain
+          wget -q https://raw.githubusercontent.com/ChrisTheCoolHut/uClibc-Cross-Compilers/master/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot.tar.xz
+          tar -xf arm-buildroot-linux-uclibcgnueabi_sdk-buildroot.tar.xz
+          bash arm-buildroot-linux-uclibcgnueabi_sdk-buildroot/relocate-sdk.sh
+
+      - name: 反汇编
+        run: |
+          BIN=toolchain/arm-buildroot-linux-uclibcgnueabi_sdk-buildroot/bin
+          $BIN/arm-buildroot-linux-uclibcgnueabi-objdump -d re/launcher_orig > disasm.txt 2>&1 || true
+          $BIN/arm-buildroot-linux-uclibcgnueabi-objdump -D -j .text re/launcher_orig > disasm_full.txt 2>&1 || true
+          $BIN/arm-buildroot-linux-uclibcgnueabi-objdump -s -j .rodata -j .data re/launcher_orig > sections.txt 2>&1 || true
+          $BIN/arm-buildroot-linux-uclibcgnueabi-readelf -a re/launcher_orig > readelf.txt 2>&1 || true
+          ls -la
+
+      - name: 上传反汇编产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: disasm
+          path: |
+            disasm.txt
+            disasm_full.txt
+            sections.txt
+            readelf.txt
+          if-no-files-found: error
