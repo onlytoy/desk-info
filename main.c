@@ -24,6 +24,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <dirent.h>
+#include <signal.h>
 #include <linux/fb.h>
 #include <linux/input.h>
 
@@ -862,6 +864,35 @@ static void draw_settings(void)
 }
 
 /* ==================== 主程序 ==================== */
+/* 停掉原厂桌面 launcher: 直接扫描 /proc 按 comm 找 pid 再 kill,
+ * 不用 system("killall")(fork /bin/sh 在低内存设备上可能 ENOMEM 失败) */
+static void kill_launcher(void)
+{
+    DIR *d = opendir("/proc");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int pid = atoi(e->d_name);
+        if (pid <= 1) continue;
+        char path[64], comm[32];
+        snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) continue;
+        int n = fread(comm, 1, sizeof(comm) - 1, f);
+        fclose(f);
+        if (n <= 0) continue;
+        comm[n] = '\0';
+        for (int i = 0; i < n; i++)
+            if (comm[i] == '\n' || comm[i] == '\r') { comm[i] = '\0'; break; }
+        if (strcmp(comm, "launcher") == 0) {
+            kill(pid, SIGTERM);
+            usleep(30000);
+            kill(pid, SIGKILL);
+        }
+    }
+    closedir(d);
+}
+
 int main(void)
 {
     int fd = open("/dev/fb0", O_RDWR);
@@ -887,7 +918,7 @@ int main(void)
     }
     sysfs_write_int(BL_BRIGHTNESS, g_cfg.brightness);
     /* 停止原厂桌面(launcher), 本程序接管屏幕 */
-    system("killall launcher 2>/dev/null");
+    kill_launcher();
     httpd_start();
     plug_start();
     touch_start();
@@ -907,6 +938,7 @@ int main(void)
     int last_page = -1, last_volume = -1, last_alarm = -1, last_ah = -1, last_am = -1;
     int alarm_fired = 0;
     int tick = 0;
+    time_t g_last_lk = 0;
     for (;;) {
         /* 旋转运行时覆盖(调试用): /tmp/desk_rotate 里写 0-3 即时切换, 免重编译 */
         if (++tick >= 30) {
@@ -914,6 +946,11 @@ int main(void)
             read_pan();
             subtitle_poll();
             battery_poll();
+            /* 周期性补杀 launcher(防启动竞态/被拉起) */
+            if (time(NULL) - g_last_lk >= 30) {
+                g_last_lk = time(NULL);
+                kill_launcher();
+            }
             /* 闹钟: 到点唤醒助手出声 */
             {
                 time_t now = time(NULL);
