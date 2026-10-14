@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <netinet/in.h>
@@ -465,6 +466,34 @@ static int parse_temp(const char *p)
     return v;
 }
 
+/* 公历 → Unix 秒(UTC), 纯整数算法, 不依赖 TZ/libm */
+static time_t civil_to_epoch(int y, int m, int d, int hh, int mi, int ss)
+{
+    y -= (m <= 2);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2u) / 5u + (unsigned)d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    long days = (long)era * 146097 + (long)doe - 719468;
+    return (time_t)(days * 86400L + hh * 3600L + mi * 60L + ss);
+}
+
+/* 从 "YYYY-MM-DDTHH:MM" 解析, 误差超过 60 秒才校准系统时钟(RTC 漂移自愈) */
+static void sync_clock_from_iso(const char *iso)
+{
+    int y, m, d, hh, mi;
+    if (sscanf(iso, "%d-%d-%dT%d:%d", &y, &m, &d, &hh, &mi) != 5) return;
+    time_t t = civil_to_epoch(y, m, d, hh, mi, 0);
+    if (t <= 0) return;
+    time_t now = time(NULL);
+    long diff = (long)(t - now);
+    if (diff > 60 || diff < -60) {
+        struct timeval tv;
+        tv.tv_sec = t; tv.tv_usec = 0;
+        settimeofday(&tv, NULL);
+    }
+}
+
 static void *weather_thread(void *arg)
 {
     (void)arg;
@@ -481,6 +510,9 @@ static void *weather_thread(void *arg)
             /* 必须从 "current":{ 里找: 前面的 current_units 里也有同名键, 值是 "°C" 字符串 */
             char *cur = strstr(buf, "\"current\":{");
             if (!cur) cur = buf;
+            /* 顺手用响应的 UTC 时间校准系统时钟(RTC 8h 漂移自愈, 不依赖 NTP) */
+            char *tmiso = strstr(cur, "\"time\":\"");
+            if (tmiso) sync_clock_from_iso(tmiso + 8);
             char *t = strstr(cur, "\"temperature_2m\":");
             char *c = strstr(cur, "\"weather_code\":");
             if (t && c) {
